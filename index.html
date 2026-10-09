@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>インベーダーゲーム</title>
+<style>
+  :root { --bg: #05060a; --fg: #e8ffe8; --accent: #3cff6b; --warn: #ff4d6d; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font-family: "Courier New", ui-monospace, monospace; overflow: hidden; touch-action: none; }
+  #wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; padding: 8px 16px; }
+  canvas { background: #000; image-rendering: pixelated; max-width: 100%; max-height: calc(100% - 80px);
+    border: 2px solid #1d3b24; box-shadow: 0 0 24px rgba(60,255,107,.15); }
+  #touch { display: none; gap: 12px; margin-top: 10px; width: 100%; max-width: 480px; }
+  #touch button { flex: 1; height: 56px; font-size: 22px; font-family: inherit; color: var(--accent);
+    background: #0c1a10; border: 2px solid #1d3b24; border-radius: 10px; user-select: none; -webkit-user-select: none; }
+  #touch button:active { background: #173a20; }
+  @media (pointer: coarse) { #touch { display: flex; } }
+  .help { font-size: 12px; opacity: .6; margin-top: 6px; text-align: center; }
+  @media (pointer: coarse) { .help { display: none; } }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="480" height="560"></canvas>
+  <div id="touch">
+    <button id="bl" aria-label="左">◀</button>
+    <button id="bf" aria-label="発射">●</button>
+    <button id="br" aria-label="右">▶</button>
+  </div>
+  <div class="help">← → / A D: 移動　Space: 発射　P: 一時停止　Enter: スタート</div>
+</div>
+<script>
+(() => {
+  'use strict';
+  const cv = document.getElementById('game');
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+
+  // ---- ドット絵スプライト（2フレーム） ----
+  const SPRITES = {
+    squid: [
+      ['...XX...','..XXXX..','.XXXXXX.','XX.XX.XX','XXXXXXXX','..X..X..','.X.XX.X.','X.X..X.X'],
+      ['...XX...','..XXXX..','.XXXXXX.','XX.XX.XX','XXXXXXXX','.X.XX.X.','X......X','.X....X.'],
+    ],
+    crab: [
+      ['..X.....X..','...X...X...','..XXXXXXX..','.XX.XXX.XX.','XXXXXXXXXXX','X.XXXXXXX.X','X.X.....X.X','...XX.XX...'],
+      ['..X.....X..','X..X...X..X','X.XXXXXXX.X','XXX.XXX.XXX','XXXXXXXXXXX','.XXXXXXXXX.','..X.....X..','.X.......X.'],
+    ],
+    octo: [
+      ['....XXXX....','.XXXXXXXXXX.','XXXXXXXXXXXX','XXX..XX..XXX','XXXXXXXXXXXX','...XX..XX...','..XX.XX.XX..','XX........XX'],
+      ['....XXXX....','.XXXXXXXXXX.','XXXXXXXXXXXX','XXX..XX..XXX','XXXXXXXXXXXX','..XXX..XXX..','.XX..XX..XX.','..XX....XX..'],
+    ],
+    player: [['.....X.....','....XXX....','....XXX....','.XXXXXXXXX.','XXXXXXXXXXX','XXXXXXXXXXX','XXXXXXXXXXX']],
+    ufo: [['.....XXXXXX.....','...XXXXXXXXXX...','..XXXXXXXXXXXX..','.XX.XX.XX.XX.XX.','XXXXXXXXXXXXXXXX','..XXX..XX..XXX..','...X........X...']],
+  };
+  const PX = 2; // 1ドットの大きさ
+  function drawSprite(rows, x, y, color, px = PX) {
+    ctx.fillStyle = color;
+    for (let r = 0; r < rows.length; r++)
+      for (let c = 0; c < rows[r].length; c++)
+        if (rows[r][c] === 'X') ctx.fillRect(x + c * px, y + r * px, px, px);
+  }
+
+  // ---- 効果音（WebAudio） ----
+  let actx = null;
+  function beep(freq, dur, type = 'square', vol = 0.05, slide = 0) {
+    try {
+      actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+      const o = actx.createOscillator(), g = actx.createGain();
+      o.type = type; o.frequency.value = freq;
+      if (slide) o.frequency.linearRampToValueAtTime(freq + slide, actx.currentTime + dur);
+      g.gain.value = vol; g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+      o.connect(g); g.connect(actx.destination); o.start(); o.stop(actx.currentTime + dur);
+    } catch (e) { /* 音が出せない環境では無視 */ }
+  }
+
+  // ---- 入力 ----
+  const keys = {};
+  addEventListener('keydown', e => {
+    if (['ArrowLeft','ArrowRight','Space','ArrowUp','ArrowDown'].includes(e.code)) e.preventDefault();
+    keys[e.code] = true;
+    if (e.code === 'Enter' || (e.code === 'Space' && state !== 'play')) startOrResume();
+    if (e.code === 'KeyP' && (state === 'play' || state === 'pause')) state = state === 'play' ? 'pause' : 'play';
+  });
+  addEventListener('keyup', e => { keys[e.code] = false; });
+  const hold = (id, code) => {
+    const b = document.getElementById(id);
+    const on = e => { e.preventDefault(); keys[code] = true; if (state !== 'play') startOrResume(); };
+    const off = e => { e.preventDefault(); keys[code] = false; };
+    b.addEventListener('pointerdown', on); b.addEventListener('pointerup', off);
+    b.addEventListener('pointerleave', off); b.addEventListener('pointercancel', off);
+  };
+  hold('bl', 'ArrowLeft'); hold('br', 'ArrowRight'); hold('bf', 'Space');
+  cv.addEventListener('pointerdown', () => { if (state !== 'play') startOrResume(); });
+
+  // ---- ゲーム状態 ----
+  let state = 'title'; // title | play | pause | dying | clear | over
+  let score = 0, hiScore = 0, lives = 3, wave = 1, timer = 0;
+  try { hiScore = +localStorage.getItem('invader-hi') || 0; } catch (e) {}
+  let player, bullets, bombs, aliens, shields, ufo, stars, particles = [];
+  let alienDir, alienStepTimer, alienFrame, stepSound;
+  const COLS = 11, ROWS = 5, AW = 24, AH = 16, GAP_X = 12, GAP_Y = 14;
+  const GROUND = H - 40;
+
+  stars = Array.from({ length: 60 }, () => ({ x: Math.random() * W, y: Math.random() * H, s: Math.random() * 0.4 + 0.1 }));
+
+  function newGame() { score = 0; lives = 3; wave = 1; setupWave(); }
+
+  function setupWave() {
+    player = { x: W / 2 - 11, y: GROUND - 20, w: 22, h: 14, cool: 0, inv: 60 };
+    bullets = []; bombs = []; particles = []; ufo = null;
+    aliens = [];
+    const startY = 80 + Math.min(wave - 1, 6) * 12;
+    const startX = (W - (COLS * AW + (COLS - 1) * GAP_X)) / 2;
+    for (let r = 0; r < ROWS; r++) {
+      const type = r === 0 ? 'squid' : r < 3 ? 'crab' : 'octo';
+      const pts = r === 0 ? 30 : r < 3 ? 20 : 10;
+      for (let c = 0; c < COLS; c++)
+        aliens.push({ x: startX + c * (AW + GAP_X), y: startY + r * (AH + GAP_Y), w: AW, h: AH, type, pts, alive: true });
+    }
+    alienDir = 1; alienStepTimer = 0; alienFrame = 0; stepSound = 0;
+    shields = [];
+    for (let i = 0; i < 4; i++) {
+      const sx = 50 + i * ((W - 100 - 44) / 3), sy = GROUND - 80;
+      const shape = ['..XXXXXXXX..','.XXXXXXXXXX.','XXXXXXXXXXXX','XXXXXXXXXXXX','XXXXXXXXXXXX','XXX......XXX','XX........XX'];
+      for (let r = 0; r < shape.length; r++)
+        for (let c = 0; c < shape[r].length; c++)
+          if (shape[r][c] === 'X') shields.push({ x: sx + c * 4, y: sy + r * 4, w: 4, h: 4, hp: 3 });
+    }
+  }
+
+  function startOrResume() {
+    if (state === 'title' || state === 'over') { newGame(); state = 'play'; }
+    else if (state === 'pause') state = 'play';
+  }
+
+  const hit = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  function burst(x, y, color, n = 14) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2, v = Math.random() * 2.5 + 0.5;
+      particles.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 30 + Math.random() * 20, color });
+    }
+  }
+  function addScore(n) { score += n; if (score > hiScore) { hiScore = score; try { localStorage.setItem('invader-hi', hiScore); } catch (e) {} } }
+
+  // ---- 更新 ----
+  function update() {
+    timer++;
+    for (const s of stars) { s.y += s.s; if (s.y > H) { s.y = 0; s.x = Math.random() * W; } }
+    for (const p of particles) { p.x += p.vx; p.y += p.vy; p.vx *= 0.96; p.vy *= 0.96; p.life--; }
+    particles = particles.filter(p => p.life > 0);
+
+    if (state === 'dying') {
+      if (--player.dead <= 0) {
+        if (lives <= 0) { state = 'over'; beep(110, 0.8, 'sawtooth', 0.06, -60); }
+        else { state = 'play'; player.inv = 90; player.x = W / 2 - 11; bombs = []; }
+      }
+      return;
+    }
+    if (state === 'clear') { if (--clearTimer <= 0) { wave++; setupWave(); state = 'play'; } return; }
+    if (state !== 'play') return;
+
+    // プレイヤー
+    const sp = 3;
+    if (keys.ArrowLeft || keys.KeyA) player.x -= sp;
+    if (keys.ArrowRight || keys.KeyD) player.x += sp;
+    player.x = Math.max(8, Math.min(W - player.w - 8, player.x));
+    if (player.cool > 0) player.cool--;
+    if (player.inv > 0) player.inv--;
+    if ((keys.Space || keys.ArrowUp || keys.KeyW) && player.cool === 0 && bullets.length < 2) {
+      bullets.push({ x: player.x + player.w / 2 - 1, y: player.y - 6, w: 2, h: 10, vy: -8 });
+      player.cool = 16; beep(880, 0.08, 'square', 0.03, -400);
+    }
+
+    // 弾
+    for (const b of bullets) b.y += b.vy;
+    bullets = bullets.filter(b => b.y + b.h > 0 && !b.dead);
+
+    // インベーダー移動（残りが少ないほど速い）
+    const alive = aliens.filter(a => a.alive);
+    const interval = Math.max(2, Math.floor(alive.length / 1.6) + 4 - Math.min(wave - 1, 5) * 2);
+    if (++alienStepTimer >= interval) {
+      alienStepTimer = 0; alienFrame ^= 1;
+      beep([98, 87, 78, 73][stepSound++ % 4], 0.07, 'square', 0.05);
+      let minX = Infinity, maxX = -Infinity;
+      for (const a of alive) { minX = Math.min(minX, a.x); maxX = Math.max(maxX, a.x + a.w); }
+      const dx = 6 * alienDir;
+      if (maxX + dx > W - 8 || minX + dx < 8) { alienDir *= -1; for (const a of alive) a.y += 14; }
+      else for (const a of alive) a.x += dx;
+    }
+
+    // インベーダーの爆弾
+    const bombRate = 0.012 + wave * 0.004 + (55 - alive.length) * 0.0006;
+    if (alive.length && Math.random() < bombRate && bombs.length < 3 + wave) {
+      // 各列の最下段から撃つ
+      const bottoms = {};
+      for (const a of alive) { const k = Math.round(a.x); if (!bottoms[k] || bottoms[k].y < a.y) bottoms[k] = a; }
+      const list = Object.values(bottoms);
+      // たまにプレイヤーを狙う
+      let shooter = list[Math.floor(Math.random() * list.length)];
+      if (Math.random() < 0.4) shooter = list.reduce((m, a) => Math.abs(a.x - player.x) < Math.abs(m.x - player.x) ? a : m, list[0]);
+      bombs.push({ x: shooter.x + shooter.w / 2 - 2, y: shooter.y + shooter.h, w: 4, h: 10, vy: 2.5 + Math.min(wave, 6) * 0.3, zig: Math.random() < 0.5 });
+    }
+    for (const b of bombs) b.y += b.vy;
+    bombs = bombs.filter(b => b.y < GROUND && !b.dead);
+
+    // UFO
+    if (!ufo && Math.random() < 0.0015 && alive.length > 6) {
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      ufo = { x: dir > 0 ? -32 : W, y: 46, w: 32, h: 14, vx: 1.6 * dir };
+    }
+    if (ufo) {
+      ufo.x += ufo.vx;
+      if (timer % 8 === 0) beep(ufo.vx > 0 ? 660 : 620, 0.08, 'sine', 0.03);
+      if (ufo.x < -40 || ufo.x > W + 40) ufo = null;
+    }
+
+    // 当たり判定: プレイヤー弾
+    for (const b of bullets) {
+      for (const a of alive) if (a.alive && hit(b, a)) {
+        a.alive = false; b.dead = true; addScore(a.pts);
+        burst(a.x + a.w / 2, a.y + a.h / 2, alienColor(a)); beep(200, 0.15, 'sawtooth', 0.05, -150); break;
+      }
+      if (!b.dead && ufo && hit(b, ufo)) {
+        const pts = [50, 100, 150, 300][Math.floor(Math.random() * 4)];
+        addScore(pts); particles.push({ x: ufo.x, y: ufo.y, vx: 0, vy: -0.3, life: 60, text: String(pts), color: '#ff4d6d' });
+        burst(ufo.x + 16, ufo.y + 7, '#ff4d6d', 24); ufo = null; b.dead = true; beep(300, 0.4, 'square', 0.06, 600);
+      }
+      if (!b.dead) for (const s of shields) if (s.hp > 0 && hit(b, s)) { s.hp--; b.dead = true; break; }
+      if (!b.dead) for (const m of bombs) if (!m.dead && hit(b, m)) { m.dead = true; b.dead = true; burst(m.x, m.y, '#fff', 6); break; }
+    }
+    // 爆弾 → シールド / プレイヤー
+    for (const m of bombs) {
+      if (m.dead) continue;
+      for (const s of shields) if (s.hp > 0 && hit(m, s)) { s.hp--; m.dead = true; break; }
+      if (!m.dead && player.inv === 0 && hit(m, player)) { m.dead = true; killPlayer(); return; }
+    }
+    // インベーダー → シールド・地面
+    for (const a of alive) {
+      for (const s of shields) if (s.hp > 0 && hit(a, s)) s.hp = 0;
+      if (a.y + a.h >= player.y) { lives = 0; killPlayer(); return; }
+    }
+
+    if (aliens.every(a => !a.alive)) { state = 'clear'; clearTimer = 120; beep(523, 0.15); setTimeout(() => beep(659, 0.15), 150); setTimeout(() => beep(784, 0.3), 300); }
+  }
+  let clearTimer = 0;
+
+  function killPlayer() {
+    lives = Math.max(0, lives - 1);
+    burst(player.x + player.w / 2, player.y + player.h / 2, '#3cff6b', 40);
+    beep(160, 0.6, 'sawtooth', 0.07, -120);
+    player.dead = 90; state = 'dying'; bullets = [];
+  }
+
+  const alienColor = a => a.type === 'squid' ? '#ff6bd6' : a.type === 'crab' ? '#6bd6ff' : '#ffe66b';
+
+  // ---- 描画 ----
+  function text(s, x, y, size, color = '#e8ffe8', align = 'center') {
+    ctx.font = `bold ${size}px "Courier New", monospace`;
+    ctx.fillStyle = color; ctx.textAlign = align; ctx.fillText(s, x, y);
+  }
+
+  function draw() {
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+    for (const s of stars) { ctx.fillStyle = `rgba(255,255,255,${s.s + 0.2})`; ctx.fillRect(s.x, s.y, 1, 1); }
+
+    // HUD
+    text(`SCORE ${String(score).padStart(5, '0')}`, 12, 26, 16, '#e8ffe8', 'left');
+    text(`HI ${String(hiScore).padStart(5, '0')}`, W / 2, 26, 16, '#3cff6b');
+    text(`WAVE ${wave}`, W - 12, 26, 16, '#e8ffe8', 'right');
+
+    if (state === 'title') {
+      text('SPACE', W / 2, 140, 44, '#3cff6b');
+      text('INVADERS', W / 2, 186, 44, '#3cff6b');
+      const rows = [['ufo', '= ? MYSTERY', '#ff4d6d'], ['squid', '= 30 PTS', '#ff6bd6'], ['crab', '= 20 PTS', '#6bd6ff'], ['octo', '= 10 PTS', '#ffe66b']];
+      rows.forEach(([t, s, c], i) => {
+        const spr = SPRITES[t][Math.floor(timer / 30) % SPRITES[t].length];
+        drawSprite(spr, W / 2 - 90, 240 + i * 40, c);
+        text(s, W / 2 + 40, 254 + i * 40, 18, '#e8ffe8');
+      });
+      if (Math.floor(timer / 30) % 2 === 0) text('PRESS ENTER / TAP TO START', W / 2, 430, 18, '#ffffff');
+      text('← → 移動  SPACE 発射  P ポーズ', W / 2, 470, 14, '#8aa');
+      drawParticles();
+      return;
+    }
+
+    // シールド
+    for (const s of shields) if (s.hp > 0) {
+      ctx.fillStyle = s.hp === 3 ? '#3cff6b' : s.hp === 2 ? '#2bb84f' : '#1a7232';
+      ctx.fillRect(s.x, s.y, s.w, s.h);
+    }
+    // インベーダー
+    for (const a of aliens) if (a.alive) {
+      const spr = SPRITES[a.type][alienFrame];
+      const ox = (a.w - spr[0].length * PX) / 2;
+      drawSprite(spr, a.x + ox, a.y, alienColor(a));
+    }
+    // UFO
+    if (ufo) drawSprite(SPRITES.ufo[0], ufo.x, ufo.y, '#ff4d6d');
+    // プレイヤー
+    if (state !== 'dying' && state !== 'over' && !(player.inv > 0 && Math.floor(timer / 4) % 2))
+      drawSprite(SPRITES.player[0], player.x, player.y, '#3cff6b');
+    // 弾
+    ctx.fillStyle = '#ffffff';
+    for (const b of bullets) ctx.fillRect(b.x, b.y, b.w, b.h);
+    for (const m of bombs) {
+      ctx.fillStyle = '#ff4d6d';
+      const z = m.zig && Math.floor(m.y / 4) % 2 ? 2 : 0;
+      ctx.fillRect(m.x + z, m.y, 2, 4); ctx.fillRect(m.x + 2 - z, m.y + 4, 2, 4); ctx.fillRect(m.x + z, m.y + 8, 2, 2);
+    }
+    drawParticles();
+
+    // 地面・残機
+    ctx.fillStyle = '#3cff6b'; ctx.fillRect(0, GROUND, W, 2);
+    text(String(lives), 14, H - 14, 16, '#e8ffe8', 'left');
+    for (let i = 0; i < Math.min(lives - 1, 5); i++) drawSprite(SPRITES.player[0], 34 + i * 30, H - 28, '#3cff6b');
+
+    if (state === 'pause') overlay('PAUSE', 'P で再開');
+    if (state === 'clear') overlay(`WAVE ${wave} CLEAR!`, '次のウェーブへ…');
+    if (state === 'over') overlay('GAME OVER', 'ENTER / TAP でリトライ', '#ff4d6d');
+  }
+  function drawParticles() {
+    for (const p of particles) {
+      ctx.globalAlpha = Math.min(1, p.life / 30);
+      if (p.text) text(p.text, p.x + 16, p.y + 12, 14, p.color);
+      else { ctx.fillStyle = p.color; ctx.fillRect(p.x, p.y, 2, 2); }
+    }
+    ctx.globalAlpha = 1;
+  }
+  function overlay(title, sub, color = '#3cff6b') {
+    ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(0, H / 2 - 60, W, 110);
+    text(title, W / 2, H / 2 - 8, 34, color);
+    text(sub, W / 2, H / 2 + 28, 16, '#ffffff');
+  }
+
+  // ---- ループ（固定 60fps 更新） ----
+  let last = performance.now(), acc = 0;
+  function loop(now) {
+    acc += Math.min(100, now - last); last = now;
+    while (acc >= 1000 / 60) { update(); acc -= 1000 / 60; }
+    draw();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
